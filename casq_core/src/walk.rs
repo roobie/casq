@@ -106,6 +106,10 @@ impl Store {
     }
 
     /// Add a directory recursively as a tree.
+    ///
+    /// Uses `symlink_metadata` so symbolic links are preserved as `Symlink`
+    /// tree entries rather than dereferenced. See
+    /// docs/decisions/0001-symlink-storage.md.
     fn add_directory(&self, path: &Path) -> Result<Hash> {
         let mut entries = Vec::new();
 
@@ -125,7 +129,10 @@ impl Store {
                 continue;
             }
 
-            let metadata = entry_path.metadata()?;
+            // symlink_metadata: does NOT follow links — required so we can
+            // distinguish symlinks from their targets and so dangling links
+            // don't blow up here with NotFound.
+            let metadata = entry_path.symlink_metadata()?;
             let file_name = entry_path
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -134,29 +141,58 @@ impl Store {
                 })?
                 .to_string();
 
-            if metadata.is_file() {
+            let file_type = metadata.file_type();
+
+            if file_type.is_symlink() {
+                let hash = self.add_symlink(entry_path)?;
+                let tree_entry =
+                    TreeEntry::new(EntryType::Symlink, file_modes::SYMLINK, hash, file_name)?;
+                entries.push(tree_entry);
+            } else if file_type.is_file() {
                 let mode = get_file_mode(&metadata);
                 let hash = self.add_file(entry_path)?;
                 let tree_entry = TreeEntry::new(EntryType::Blob, mode, hash, file_name)?;
                 entries.push(tree_entry);
-            } else if metadata.is_dir() {
-                // Recursively process subdirectory
+            } else if file_type.is_dir() {
                 let hash = self.add_directory(entry_path)?;
                 let tree_entry =
                     TreeEntry::new(EntryType::Tree, file_modes::DIRECTORY, hash, file_name)?;
                 entries.push(tree_entry);
-            } else if metadata.is_symlink() {
-                // Symlinks not supported in MVP
-                return Err(Error::invalid_hash(format!(
-                    "Symlinks not supported: {}",
-                    entry_path.display()
-                )));
             }
+            // Other types (sockets, fifos, char/block devices) are silently
+            // skipped — they have no portable representation in a CAS tree.
         }
 
         // Create tree from entries
         self.put_tree(entries)
     }
+
+    /// Add a symbolic link as a blob containing its target bytes.
+    ///
+    /// The blob payload is the raw bytes of the link target as returned by
+    /// `read_link` (Unix paths are arbitrary byte sequences, not guaranteed
+    /// UTF-8). Broken/dangling links are stored too — we never dereference.
+    fn add_symlink(&self, path: &Path) -> Result<Hash> {
+        let target: std::path::PathBuf = std::fs::read_link(path)?;
+        let bytes = symlink_target_bytes(target.as_os_str());
+        self.put_blob(std::io::Cursor::new(bytes))
+    }
+}
+
+/// Convert an `OsStr` symlink target to the bytes we store in the blob.
+///
+/// On Unix paths are byte sequences; we capture them losslessly.
+/// On other platforms we fall back to UTF-8 (lossy) since the materialize
+/// side has no portable way to recreate non-Unicode symlinks anyway.
+#[cfg(unix)]
+fn symlink_target_bytes(s: &std::ffi::OsStr) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    s.as_bytes().to_vec()
+}
+
+#[cfg(not(unix))]
+fn symlink_target_bytes(s: &std::ffi::OsStr) -> Vec<u8> {
+    s.to_string_lossy().into_owned().into_bytes()
 }
 
 /// Get the file mode (permissions) from metadata.
@@ -386,6 +422,102 @@ mod tests {
         let blob = store.get_blob(&hash).unwrap();
         assert_eq!(blob.len(), input.len());
         assert_eq!(blob, input);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_add_directory_with_symlink_to_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = Store::init(temp_dir.path().join("store"), Algorithm::Blake3).unwrap();
+
+        let test_dir = temp_dir.path().join("d");
+        fs::create_dir(&test_dir).unwrap();
+        fs::write(test_dir.join("real.txt"), b"hello").unwrap();
+        std::os::unix::fs::symlink("real.txt", test_dir.join("link.txt")).unwrap();
+
+        let hash = store.add_path(&test_dir).unwrap();
+        let tree = store.get_tree(&hash).unwrap();
+        assert_eq!(tree.len(), 2);
+
+        let link = tree.iter().find(|e| e.name == "link.txt").unwrap();
+        assert_eq!(link.entry_type, EntryType::Symlink);
+        assert_eq!(link.mode, file_modes::SYMLINK);
+
+        // The symlink's hash points at a blob containing the target bytes.
+        let target_bytes = store.get_blob(&link.hash).unwrap();
+        assert_eq!(target_bytes, b"real.txt");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_add_directory_with_broken_symlink() {
+        // Dangling links must be stored verbatim, not error out.
+        let temp_dir = TempDir::new().unwrap();
+        let store = Store::init(temp_dir.path().join("store"), Algorithm::Blake3).unwrap();
+
+        let test_dir = temp_dir.path().join("d");
+        fs::create_dir(&test_dir).unwrap();
+        std::os::unix::fs::symlink("/no/such/path/anywhere", test_dir.join("dangling")).unwrap();
+
+        let hash = store.add_path(&test_dir).unwrap();
+        let tree = store.get_tree(&hash).unwrap();
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].entry_type, EntryType::Symlink);
+
+        let target = store.get_blob(&tree[0].hash).unwrap();
+        assert_eq!(target, b"/no/such/path/anywhere");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_symlink_roundtrip_via_materialize() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = Store::init(temp_dir.path().join("store"), Algorithm::Blake3).unwrap();
+
+        let src = temp_dir.path().join("src");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("payload"), b"the goods").unwrap();
+        std::os::unix::fs::symlink("payload", src.join("alias")).unwrap();
+        std::os::unix::fs::symlink("/absolute/dangling", src.join("orphan")).unwrap();
+
+        let hash = store.add_path(&src).unwrap();
+
+        let restored = temp_dir.path().join("restored");
+        store.materialize(&hash, &restored).unwrap();
+
+        // alias resolves to the real file
+        let alias = restored.join("alias");
+        let alias_meta = alias.symlink_metadata().unwrap();
+        assert!(alias_meta.file_type().is_symlink());
+        assert_eq!(fs::read_link(&alias).unwrap().to_str().unwrap(), "payload");
+
+        // orphan is recreated as a dangling link
+        let orphan = restored.join("orphan");
+        let orphan_meta = orphan.symlink_metadata().unwrap();
+        assert!(orphan_meta.file_type().is_symlink());
+        assert_eq!(
+            fs::read_link(&orphan).unwrap().to_str().unwrap(),
+            "/absolute/dangling"
+        );
+        assert!(!orphan.exists()); // target really is missing
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_symlink_targets_dedup_via_cas() {
+        // Two symlinks with the same target should share a single blob.
+        let temp_dir = TempDir::new().unwrap();
+        let store = Store::init(temp_dir.path().join("store"), Algorithm::Blake3).unwrap();
+
+        let test_dir = temp_dir.path().join("d");
+        fs::create_dir(&test_dir).unwrap();
+        std::os::unix::fs::symlink("same/target", test_dir.join("a")).unwrap();
+        std::os::unix::fs::symlink("same/target", test_dir.join("b")).unwrap();
+
+        let hash = store.add_path(&test_dir).unwrap();
+        let tree = store.get_tree(&hash).unwrap();
+        assert_eq!(tree.len(), 2);
+        assert_eq!(tree[0].hash, tree[1].hash, "identical targets must dedup");
     }
 
     #[test]

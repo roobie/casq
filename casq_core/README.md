@@ -235,11 +235,12 @@ The following are intentionally **not supported**:
 - ❌ Multi-user/concurrent access
 - ❌ Encryption (planned for future)
 - ❌ Parallel operations (single-threaded)
-- ❌ Symbolic links
-- ❌ Special file types (devices, sockets, etc.)
+- ❌ Special file types (devices, sockets, fifos, etc.) — silently skipped during walk
 - ❌ Extended attributes or ACLs beyond basic POSIX permissions
 
-**Note**: Compression and chunking are now supported in v0.4.0+
+**Note**: Compression and chunking are supported in v0.4.0+. Symbolic links are
+supported as of the current release (see
+[ADR 0001](../docs/decisions/0001-symlink-storage.md)).
 
 ## Performance Characteristics
 

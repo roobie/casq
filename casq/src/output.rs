@@ -95,19 +95,23 @@ impl OutputWriter {
     /// In JSON mode, writes a JSON error object with success=false.
     /// In text mode, writes the error message directly.
     pub fn write_error(&self, error: &anyhow::Error, result_code: u8) {
+        // `{:#}` renders the full anyhow context chain as
+        // "outer: inner: root", so the actual cause (e.g. which symlink
+        // triggered the failure) reaches the user instead of being swallowed
+        // by the top-level `with_context` message.
         match self.format {
             OutputFormat::Json => {
                 let error_output = ErrorOutput {
                     success: false,
                     result_code,
-                    error: error.to_string(),
+                    error: format!("{:#}", error),
                 };
                 if let Ok(json) = serde_json::to_string_pretty(&error_output) {
                     let _ = writeln!(io::stderr(), "{}", json);
                 }
             }
             OutputFormat::Text => {
-                let _ = writeln!(io::stderr(), "Error: {}", error);
+                let _ = writeln!(io::stderr(), "Error: {:#}", error);
             }
         }
     }

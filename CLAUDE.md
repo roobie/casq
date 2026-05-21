@@ -152,12 +152,17 @@ $STORE_ROOT/
 
 **Tree entry format:**
 ```
-0     1    type (u8): 1=blob, 2=tree
+0     1    type (u8): 1=blob, 2=tree, 3=symlink
 1     4    mode (u32 LE, POSIX)
 5     32   hash (raw 32-byte digest)
 37    1    name_len (u8)
 38    N    name bytes (UTF-8)
 ```
+
+Note: tree-entry type byte and object-header type byte share values 1 and 2
+(Blob, Tree) but diverge at 3. Object header 3 = ChunkList. Tree entry 3 =
+Symlink (the hash points to a Blob object whose payload is the symlink's
+target bytes). See docs/decisions/0001-symlink-storage.md.
 
 **ChunkList entry format (40 bytes per chunk):**
 ```
@@ -314,6 +319,8 @@ When implementing new features:
 - ✅ Content-defined chunking with FastCDC (files ≥ 1MB)
 - ✅ Atomic object writes with tempfile
 - ✅ Hash-based deduplication (including chunk-level deduplication)
+- ✅ Symbolic link support — preserved within trees, dereferenced at top-level
+  `casq put` (see docs/decisions/0001-symlink-storage.md)
 
 **Object Format:**
 - ✅ v2 format with compression support
@@ -352,6 +359,8 @@ When implementing new features:
 - No remote backends (local-only by design)
 - No object caching (direct disk I/O)
 - No snapshot abstractions (use references)
+- Special file types (devices, sockets, fifos) are silently skipped during
+  tree walks. Symbolic links *are* supported (ADR 0001).
 
 ### Storage Performance
 

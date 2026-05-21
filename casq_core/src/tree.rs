@@ -11,6 +11,9 @@ pub enum EntryType {
     Blob = 1,
     /// A subtree (directory).
     Tree = 2,
+    /// A symbolic link. Hash references a blob containing the link target bytes.
+    /// See docs/decisions/0001-symlink-storage.md.
+    Symlink = 3,
 }
 
 impl EntryType {
@@ -24,6 +27,7 @@ impl EntryType {
         match value {
             1 => Ok(EntryType::Blob),
             2 => Ok(EntryType::Tree),
+            3 => Ok(EntryType::Symlink),
             _ => Err(Error::invalid_tree_entry(format!(
                 "Invalid entry type: {}",
                 value
@@ -47,6 +51,9 @@ pub mod file_modes {
 
     /// Directory.
     pub const DIRECTORY: FileMode = 0o040755;
+
+    /// Symbolic link (POSIX S_IFLNK | 0o777). Matches git's symlink mode.
+    pub const SYMLINK: FileMode = 0o120777;
 }
 
 /// An entry in a tree (file or subdirectory).
@@ -91,9 +98,9 @@ impl TreeEntry {
     /// Encode the entry to bytes.
     ///
     /// Format:
-    /// - 1 byte: type (1=blob, 2=tree)
+    /// - 1 byte: type (1=blob, 2=tree, 3=symlink)
     /// - 4 bytes: mode (u32 LE)
-    /// - 32 bytes: hash
+    /// - 32 bytes: hash (for symlinks: hash of the target-path blob)
     /// - 1 byte: name_len
     /// - N bytes: name (UTF-8)
     pub fn encode(&self) -> Vec<u8> {
@@ -320,7 +327,7 @@ mod tests {
     // Strategy for generating valid tree entries
     fn arb_tree_entry() -> impl Strategy<Value = TreeEntry> {
         (
-            prop::sample::select(vec![EntryType::Blob, EntryType::Tree]),
+            prop::sample::select(vec![EntryType::Blob, EntryType::Tree, EntryType::Symlink]),
             any::<u32>(),
             prop::array::uniform32(any::<u8>()),
             arb_entry_name(),
@@ -386,7 +393,7 @@ mod tests {
         /// Property 12: Empty names are rejected
         #[test]
         fn prop_empty_name_rejected(
-            entry_type in prop::sample::select(vec![EntryType::Blob, EntryType::Tree]),
+            entry_type in prop::sample::select(vec![EntryType::Blob, EntryType::Tree, EntryType::Symlink]),
             mode in any::<u32>(),
             hash_bytes in prop::array::uniform32(any::<u8>()),
         ) {

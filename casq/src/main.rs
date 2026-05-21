@@ -409,6 +409,7 @@ fn cmd_list(
                     entry_type: match e.entry_type {
                         casq_core::EntryType::Blob => "blob".to_string(),
                         casq_core::EntryType::Tree => "tree".to_string(),
+                        casq_core::EntryType::Symlink => "symlink".to_string(),
                     },
                     mode: if long {
                         Some(format!("{:06o}", e.mode))
@@ -435,6 +436,7 @@ fn cmd_list(
                         let type_char = match entry.entry_type {
                             casq_core::EntryType::Blob => 'b',
                             casq_core::EntryType::Tree => 't',
+                            casq_core::EntryType::Symlink => 'l',
                         };
                         text.push_str(&format!(
                             "{} {:06o} {} {}\n",

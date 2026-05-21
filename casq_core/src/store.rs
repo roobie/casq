@@ -599,6 +599,10 @@ impl Store {
                 crate::tree::EntryType::Tree => {
                     self.materialize_tree(&entry.hash, &entry_path)?;
                 }
+                crate::tree::EntryType::Symlink => {
+                    let target = self.get_blob(&entry.hash)?;
+                    create_symlink(&target, &entry_path)?;
+                }
             }
         }
 
@@ -625,6 +629,46 @@ impl Store {
     pub fn cat_blob<W: Write>(&self, hash: &Hash, writer: W) -> Result<()> {
         self.blob_to_writer(hash, writer)
     }
+}
+
+/// Create a symbolic link at `dest` pointing at `target` (raw bytes).
+///
+/// Symlink targets are stored as opaque byte sequences (Unix paths are not
+/// guaranteed UTF-8). See docs/decisions/0001-symlink-storage.md.
+#[cfg(unix)]
+fn create_symlink(target: &[u8], dest: &Path) -> Result<()> {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    std::os::unix::fs::symlink(OsStr::from_bytes(target), dest)?;
+    Ok(())
+}
+
+/// Symlink creation falls back to lossy UTF-8 on non-Unix. Windows symlinks
+/// distinguish file vs dir targets; we don't have that info in the tree
+/// entry, so creation as a file symlink may fail without admin privileges.
+#[cfg(not(unix))]
+fn create_symlink(target: &[u8], dest: &Path) -> Result<()> {
+    let target_str = std::str::from_utf8(target).map_err(|e| {
+        Error::invalid_hash(format!("Non-UTF-8 symlink target on non-Unix host: {}", e))
+    })?;
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_file(target_str, dest)?;
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = target_str;
+        return Err(Error::invalid_hash(
+            "Symlink materialization not supported on this platform".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Compress data using zstd.
